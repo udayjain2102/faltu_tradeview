@@ -191,19 +191,30 @@ async function fetchStockData(symbol, tf){
     const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=${interval}&range=${range}`;
     let lastErr, j;
     const proxies = getProxies();
+    const hasCustom = !!localStorage.getItem('customProxy');
+    let lastDetail = '';
     for(let attempt=0; attempt<2; attempt++){
       for(const wrap of proxies){
         try{
           const r = await tFetch(wrap(url), 8000);
-          if(!r.ok){ lastErr = new Error('HTTP '+r.status); continue; }
+          if(!r.ok){ lastDetail = 'HTTP '+r.status; continue; }
           const t = await r.text();
-          try { j = JSON.parse(t); } catch { lastErr = new Error('bad json'); continue; }
+          try { j = JSON.parse(t); }
+          catch { lastDetail = 'proxy returned non-JSON (likely rate-limited)'; continue; }
           if(j?.chart?.result?.[0]) return parseYahoo(j, tf);
-          lastErr = new Error(j?.chart?.error?.description || 'no data');
-        }catch(e){ lastErr = e; }
+          if(j?.error) { lastDetail = 'proxy error: '+(typeof j.error==='string'?j.error:JSON.stringify(j.error)); continue; }
+          lastDetail = j?.chart?.error?.description || 'no data for '+symbol;
+          // Yahoo's own "symbol not found" — no point retrying other proxies
+          if(j?.chart?.error) throw new Error(lastDetail);
+        }catch(e){
+          if(e.message && e.message.startsWith('no data')) throw e;
+          lastDetail = e.message || 'fetch failed';
+          lastErr = e;
+        }
       }
     }
-    throw lastErr || new Error('all proxies failed');
+    const hint = hasCustom ? '' : ' — set ⚙ Proxy';
+    throw new Error(lastDetail + hint);
   } finally { release(); }
 }
 
