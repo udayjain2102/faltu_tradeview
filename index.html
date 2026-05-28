@@ -201,7 +201,7 @@ async function fetchStockData(symbol, tf, signal=null){
         if(attempt===0) continue;
       }
     }
-    throw lastErr || new Error('fetch failed — is the server running? (node server.js)');
+    throw lastErr || new Error('fetch failed');
   } finally { release(); }
 }
 
