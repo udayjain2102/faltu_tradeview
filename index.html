@@ -1,5 +1,6 @@
 <!doctype html>
 <html lang="en">
+  
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
@@ -139,30 +140,9 @@ const TF_MAP = {
   '1W': {interval:'1wk', range:'5y'},
 };
 
-// User-configurable proxy (persisted) tried first; public proxies as fallback.
-// Public proxies are unreliable in 2025 — deploy your own Cloudflare Worker
-// (see README at top of file) for stable Indian/global symbol coverage.
-function customProxyWrap(){
-  const p = localStorage.getItem('customProxy');
-  if(!p) return null;
-  return u => p.includes('{url}') ? p.replace('{url}', encodeURIComponent(u))
-                                  : p.replace(/\/?$/, '/') + u;
-}
-// Same-origin proxy — exists when served by Vercel (api/yahoo.js) or by
-// the bundled local server.js. Tried first; if it 404s (static file open),
-// we fall through to public proxies.
-const sameOriginProxy = u => '/api/yahoo?url=' + encodeURIComponent(u);
-
-function getProxies(){
-  const list = [
-    sameOriginProxy,
-    u => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(u),
-    u => 'https://corsproxy.io/?' + encodeURIComponent(u),
-    u => 'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(u),
-  ];
-  const cp = customProxyWrap();
-  return cp ? [cp, ...list] : list;
-}
+// All Yahoo Finance requests go through the local server at /api/yahoo.
+// Run:  node server.js   then open http://localhost:3000
+const YAHOO_PROXY = u => '/api/yahoo?url=' + encodeURIComponent(u);
 
 // Bounded-concurrency queue (2 in flight) so a slow proxy can't stall siblings.
 const MAX_CONCURRENT = 2;
@@ -183,45 +163,45 @@ function release(){
   if(next) next();
 }
 
-// fetch with AbortController timeout
-async function tFetch(url, ms=8000){
+// fetch with AbortController timeout covering both headers and body read
+async function tFetch(url, ms=8000, externalSignal){
   const ctl = new AbortController();
+  if(externalSignal?.aborted){ throw new DOMException('Aborted','AbortError'); }
+  externalSignal?.addEventListener('abort', ()=>ctl.abort(), {once:true});
   const id = setTimeout(()=>ctl.abort(), ms);
-  try { return await fetch(url, {signal: ctl.signal}); }
-  finally { clearTimeout(id); }
+  try {
+    const r = await fetch(url, {signal: ctl.signal});
+    const text = await r.text();
+    return {ok: r.ok, status: r.status, text};
+  } finally { clearTimeout(id); }
 }
 
-async function fetchStockData(symbol, tf){
+async function fetchStockData(symbol, tf, signal=null){
   await acquire();
+  if(signal?.aborted){ release(); throw new DOMException('Aborted','AbortError'); }
   try {
     const {interval, range} = TF_MAP[tf] || TF_MAP['1D'];
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=${interval}&range=${range}`;
-    let lastErr, j;
-    const proxies = getProxies();
-    const hasCustom = !!localStorage.getItem('customProxy');
-    let lastDetail = '';
+    const yahooUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=${interval}&range=${range}`;
+    let lastErr;
     for(let attempt=0; attempt<2; attempt++){
-      for(const wrap of proxies){
-        try{
-          const r = await tFetch(wrap(url), 8000);
-          if(!r.ok){ lastDetail = 'HTTP '+r.status; continue; }
-          const t = await r.text();
-          try { j = JSON.parse(t); }
-          catch { lastDetail = 'proxy returned non-JSON (likely rate-limited)'; continue; }
-          if(j?.chart?.result?.[0]) return parseYahoo(j, tf);
-          if(j?.error) { lastDetail = 'proxy error: '+(typeof j.error==='string'?j.error:JSON.stringify(j.error)); continue; }
-          lastDetail = j?.chart?.error?.description || 'no data for '+symbol;
-          // Yahoo's own "symbol not found" — no point retrying other proxies
-          if(j?.chart?.error) throw new Error(lastDetail);
-        }catch(e){
-          if(e.message && e.message.startsWith('no data')) throw e;
-          lastDetail = e.message || 'fetch failed';
-          lastErr = e;
-        }
+      if(signal?.aborted) throw new DOMException('Aborted','AbortError');
+      try{
+        const {ok, status, text: t} = await tFetch(YAHOO_PROXY(yahooUrl), 8000, signal);
+        if(!ok) throw new Error('HTTP '+status);
+        let j;
+        try { j = JSON.parse(t); }
+        catch { throw new Error('server returned non-JSON'); }
+        if(j?.chart?.result?.[0]) return parseYahoo(j, tf);
+        const desc = j?.chart?.error?.description || 'no data for '+symbol;
+        throw new Error(desc);
+      }catch(e){
+        if(e.name==='AbortError') throw e;
+        if(e.message && e.message.startsWith('no data')) throw e;
+        lastErr = e;
+        if(attempt===0) continue;
       }
     }
-    const hint = hasCustom ? '' : ' — set ⚙ Proxy';
-    throw new Error(lastDetail + hint);
+    throw lastErr || new Error('fetch failed — is the server running? (node server.js)');
   } finally { release(); }
 }
 
@@ -231,7 +211,7 @@ function parseYahoo(j, tf){
   const q = res.indicators.quote[0];
   const bars = [];
   for(let i=0;i<ts.length;i++){
-    if(q.open[i]==null||q.close[i]==null) continue;
+    if(q.open[i]==null||q.high[i]==null||q.low[i]==null||q.close[i]==null) continue;
     bars.push({time:ts[i], open:q.open[i], high:q.high[i], low:q.low[i],
                close:q.close[i], volume:q.volume[i]||0});
   }
@@ -308,20 +288,6 @@ function Toolbar({layout,setLayout, gType,setGType, gTf,setGTf, onApplyAll}){
           <Btn key={tf} active={gTf===tf} onClick={()=>setGTf(tf)}>{tf}</Btn>)}
       </Group>
       <Btn onClick={onApplyAll}>Apply default TF/type to all</Btn>
-      <Btn onClick={()=>{
-        const cur = localStorage.getItem('customProxy') || '';
-        const v = prompt(
-          'Custom CORS proxy URL (leave blank to use public proxies).\n' +
-          'Use {url} as placeholder, or end with "/" for path-append style.\n\n' +
-          'Examples:\n' +
-          '  https://your-worker.workers.dev/?url={url}\n' +
-          '  https://your-proxy.com/',
-          cur);
-        if(v===null) return;
-        if(v.trim()==='') localStorage.removeItem('customProxy');
-        else localStorage.setItem('customProxy', v.trim());
-        alert('Saved. Reload or re-fetch to apply.');
-      }}>⚙ Proxy</Btn>
     </div>
   );
 }
@@ -420,10 +386,9 @@ function splitSym(full){
 }
 
 function PanelHeader({symbol, onSymbol, tf, setTf, type, setType, last, chg, pct, onToggleInd}){
-  const split = splitSym(symbol);
-  const [val, setVal] = useState(split.base);
-  const [ex, setEx]   = useState(split.ex);
-  useEffect(()=>{ const s=splitSym(symbol); setVal(s.base); setEx(s.ex); }, [symbol]);
+  const [val, setVal] = useState(()=>splitSym(symbol).base);
+  const [ex, setEx]   = useState(()=>splitSym(symbol).ex);
+  useEffect(()=>{ const {base,ex:e}=splitSym(symbol); setVal(base); setEx(e); }, [symbol]);
 
   const submit = (rawSym, exchange)=>{
     const base = rawSym.trim().toUpperCase().replace(/\.(NS|BO)$/,'');
@@ -433,7 +398,7 @@ function PanelHeader({symbol, onSymbol, tf, setTf, type, setType, last, chg, pct
 
   return (
     <div className="flex items-center gap-2 px-2 py-1.5 border-b border-[#2a2e39] bg-[#1e222d] flex-wrap">
-      <select value={ex} onChange={e=>{ setEx(e.target.value); submit(val, e.target.value); }}
+      <select value={ex} onChange={e=>setEx(e.target.value)}
         className="bg-[#131722] border border-[#434651] rounded px-1 py-0.5 text-xs">
         {Object.entries(EXCHANGES).map(([k,v])=><option key={k} value={k}>{v.label}</option>)}
       </select>
@@ -501,15 +466,15 @@ function ChartPanel({initialSymbol, initialTf, initialType}){
 
   // load data — clear bars first so a failed load doesn't leave the prior chart on screen
   useEffect(()=>{
-    let cancelled=false;
+    const ctl = new AbortController();
     setLoading(true); setErr(null); setBars([]);
-    fetchStockData(symbol, tf)
-      .then(b=>{ if(!cancelled){
+    fetchStockData(symbol, tf, ctl.signal)
+      .then(b=>{ if(!ctl.signal.aborted){
         if(!b || b.length===0){ setErr('no data for '+symbol); setLoading(false); return; }
         setBars(b); setLoading(false);
       } })
-      .catch(e=>{ if(!cancelled){ setErr(e.message); setLoading(false); } });
-    return ()=>{ cancelled=true; };
+      .catch(e=>{ if(!ctl.signal.aborted && e.name!=='AbortError'){ setErr(e.message); setLoading(false); } });
+    return ()=>{ ctl.abort(); };
   }, [symbol, tf]);
 
   // create/destroy charts based on which sub-panes are enabled
@@ -531,14 +496,15 @@ function ChartPanel({initialSymbol, initialTf, initialType}){
     } else if(!ind.macd.enabled && c.macd){ c.macd.remove(); c.macd=null; }
 
     // sync sub-panes to main timescale
-    if(c.main){
-      const main = c.main;
-      const subs = ()=> [c.vol, c.rsi, c.macd].filter(Boolean);
-      main.timeScale().subscribeVisibleLogicalRangeChange(r=>{
-        if(!r) return;
-        subs().forEach(s=> s.timeScale().setVisibleLogicalRange(r));
-      });
-    }
+    if(!c.main) return;
+    const main = c.main;
+    const subs = ()=> [c.vol, c.rsi, c.macd].filter(Boolean);
+    const syncHandler = r=>{
+      if(!r) return;
+      subs().forEach(s=> s.timeScale().setVisibleLogicalRange(r));
+    };
+    main.timeScale().subscribeVisibleLogicalRangeChange(syncHandler);
+    return ()=>{ main.timeScale().unsubscribeVisibleLogicalRangeChange(syncHandler); };
   }, [ind.volume, ind.rsi.enabled, ind.macd.enabled]);
 
   // resize handling
@@ -642,9 +608,9 @@ function ChartPanel({initialSymbol, initialTf, initialType}){
     const s = c.addLineSeries({color:'#ba68c8', lineWidth:2, priceLineVisible:false});
     s.setData(rsiData);
     const ob = c.addLineSeries({color:'rgba(239,83,80,0.5)', lineWidth:1, lineStyle:2, priceLineVisible:false});
-    ob.setData(bars.map(b=>({time:b.time, value:70})));
+    ob.setData(rsiData.map(p=>({time:p.time, value:70})));
     const os = c.addLineSeries({color:'rgba(38,166,154,0.5)', lineWidth:1, lineStyle:2, priceLineVisible:false});
-    os.setData(bars.map(b=>({time:b.time, value:30})));
+    os.setData(rsiData.map(p=>({time:p.time, value:30})));
     c._series.push(s, ob, os);
   }, [bars, ind.rsi.enabled, ind.rsi.period]);
 
@@ -704,10 +670,10 @@ function App(){
   // a key bump forces all panels to remount with new defaults on "Apply All"
   const [applyKey, setApplyKey] = useState(0);
 
-  const gridCls = {1:'grid-cols-1 grid-rows-1',
-                   2:'grid-cols-2 grid-rows-1',
-                   4:'grid-cols-2 grid-rows-2',
-                   6:'grid-cols-3 grid-rows-2'}[layout];
+  const gridCls = ({1:'grid-cols-1 grid-rows-1',
+                    2:'grid-cols-2 grid-rows-1',
+                    4:'grid-cols-2 grid-rows-2',
+                    6:'grid-cols-3 grid-rows-2'}[layout]) ?? 'grid-cols-2 grid-rows-2';
 
   return (
     <div className="h-full flex flex-col">

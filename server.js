@@ -2,8 +2,6 @@
 // Run with:  node server.js
 // Then open: http://localhost:3000
 //
-// In the dashboard, click ⚙ Proxy and set:  /api/yahoo?url={url}
-//
 // No external dependencies — uses only Node built-ins (>= v18 for global fetch).
 
 import http from 'node:http';
