@@ -1,0 +1,719 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Multi-Chart Stock Dashboard</title>
+
+<script src="https://cdn.tailwindcss.com"></script>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+
+<style>
+  html,body,#root{height:100%;margin:0;background:#131722;color:#d1d4dc;
+    font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;font-size:13px}
+  input,select,button{font-family:inherit}
+  .scroll-thin::-webkit-scrollbar{width:6px;height:6px}
+  .scroll-thin::-webkit-scrollbar-thumb{background:#363a45;border-radius:3px}
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="env,react">
+const { useState, useEffect, useRef, useMemo, useCallback } = React;
+
+/* =========================================================================
+ *  INDICATOR MATH  (all implemented from scratch)
+ * =========================================================================*/
+
+// Simple Moving Average — rolling mean of closes
+function calcSMA(bars, period){
+  const out = []; let sum=0;
+  for(let i=0;i<bars.length;i++){
+    sum += bars[i].close;
+    if(i>=period) sum -= bars[i-period].close;
+    if(i>=period-1) out.push({time:bars[i].time, value:sum/period});
+  }
+  return out;
+}
+
+// EMA — recursive; seeded with SMA of first N values
+function calcEMA(bars, period){
+  if(bars.length < period) return [];
+  const k = 2/(period+1);
+  const out = [];
+  let prev = 0;
+  for(let i=0;i<period;i++) prev += bars[i].close;
+  prev /= period;
+  out.push({time:bars[period-1].time, value:prev});
+  for(let i=period;i<bars.length;i++){
+    prev = bars[i].close*k + prev*(1-k);
+    out.push({time:bars[i].time, value:prev});
+  }
+  return out;
+}
+
+// Bollinger Bands — middle = SMA(N), upper/lower = mid ± mult·stddev
+function calcBB(bars, period=20, mult=2){
+  const out = [];
+  for(let i=period-1;i<bars.length;i++){
+    let m=0; for(let j=i-period+1;j<=i;j++) m+=bars[j].close; m/=period;
+    let v=0; for(let j=i-period+1;j<=i;j++) v+=(bars[j].close-m)**2;
+    const sd = Math.sqrt(v/period);
+    out.push({time:bars[i].time, upper:m+mult*sd, middle:m, lower:m-mult*sd});
+  }
+  return out;
+}
+
+// VWAP — cumulative(TP × V) / cumulative(V); resets each calendar day
+function calcVWAP(bars){
+  const out=[]; let cumPV=0, cumV=0, lastDay=null;
+  for(const b of bars){
+    const d = new Date(b.time*1000).toISOString().slice(0,10);
+    if(d !== lastDay){ cumPV=0; cumV=0; lastDay=d; }
+    const tp = (b.high+b.low+b.close)/3;
+    cumPV += tp*b.volume; cumV += b.volume;
+    if(cumV>0) out.push({time:b.time, value:cumPV/cumV});
+  }
+  return out;
+}
+
+// RSI — Wilder smoothing on average gains/losses
+function calcRSI(bars, period=14){
+  if(bars.length<=period) return [];
+  const out=[]; let g=0, l=0;
+  for(let i=1;i<=period;i++){
+    const d = bars[i].close-bars[i-1].close;
+    if(d>=0) g+=d; else l-=d;
+  }
+  let avgG = g/period, avgL = l/period;
+  out.push({time:bars[period].time, value: avgL===0?100: 100-100/(1+avgG/avgL)});
+  for(let i=period+1;i<bars.length;i++){
+    const d = bars[i].close-bars[i-1].close;
+    const gi = d>0?d:0, li = d<0?-d:0;
+    avgG = (avgG*(period-1)+gi)/period;
+    avgL = (avgL*(period-1)+li)/period;
+    out.push({time:bars[i].time, value: avgL===0?100: 100-100/(1+avgG/avgL)});
+  }
+  return out;
+}
+
+// MACD: macd = EMA(fast) − EMA(slow); signal = EMA(macd, signalP); hist = macd - signal
+function calcMACD(bars, fast=12, slow=26, signalP=9){
+  const ef = calcEMA(bars, fast), es = calcEMA(bars, slow);
+  // align by time
+  const efMap = new Map(ef.map(p=>[p.time,p.value]));
+  const macdLine = [];
+  for(const p of es){
+    const ev = efMap.get(p.time);
+    if(ev!=null) macdLine.push({time:p.time, value: ev - p.value});
+  }
+  // signal = EMA over macdLine values (treat as bars by mapping value->close)
+  const sigBars = macdLine.map(p=>({time:p.time, close:p.value}));
+  const sig = calcEMA(sigBars, signalP);
+  const sigMap = new Map(sig.map(p=>[p.time,p.value]));
+  const out = [];
+  for(const p of macdLine){
+    const sv = sigMap.get(p.time);
+    out.push({time:p.time, macd:p.value, signal: sv ?? null,
+              histogram: sv!=null ? p.value - sv : null});
+  }
+  return out;
+}
+
+/* =========================================================================
+ *  DATA FETCH (Yahoo Finance via proxy chain + serial queue)
+ * =========================================================================*/
+
+const TF_MAP = {
+  '1m': {interval:'1m',  range:'5d'},
+  '5m': {interval:'5m',  range:'1mo'},
+  '15m':{interval:'15m', range:'1mo'},
+  '1h': {interval:'60m', range:'3mo'},
+  '4h': {interval:'60m', range:'1y'},   // resampled in JS
+  '1D': {interval:'1d',  range:'2y'},
+  '1W': {interval:'1wk', range:'5y'},
+};
+
+// User-configurable proxy (persisted) tried first; public proxies as fallback.
+// Public proxies are unreliable in 2025 — deploy your own Cloudflare Worker
+// (see README at top of file) for stable Indian/global symbol coverage.
+function customProxyWrap(){
+  const p = localStorage.getItem('customProxy');
+  if(!p) return null;
+  return u => p.includes('{url}') ? p.replace('{url}', encodeURIComponent(u))
+                                  : p.replace(/\/?$/, '/') + u;
+}
+function getProxies(){
+  const list = [
+    u => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(u),
+    u => 'https://corsproxy.io/?' + encodeURIComponent(u),
+    u => 'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(u),
+  ];
+  const cp = customProxyWrap();
+  return cp ? [cp, ...list] : list;
+}
+
+// Bounded-concurrency queue (2 in flight) so a slow proxy can't stall siblings.
+const MAX_CONCURRENT = 2;
+let _inFlight = 0;
+const _waiters = [];
+function acquire(){
+  return new Promise(res=>{
+    const tryGo = ()=>{
+      if(_inFlight < MAX_CONCURRENT){ _inFlight++; res(); }
+      else _waiters.push(tryGo);
+    };
+    tryGo();
+  });
+}
+function release(){
+  _inFlight--;
+  const next = _waiters.shift();
+  if(next) next();
+}
+
+// fetch with AbortController timeout
+async function tFetch(url, ms=8000){
+  const ctl = new AbortController();
+  const id = setTimeout(()=>ctl.abort(), ms);
+  try { return await fetch(url, {signal: ctl.signal}); }
+  finally { clearTimeout(id); }
+}
+
+async function fetchStockData(symbol, tf){
+  await acquire();
+  try {
+    const {interval, range} = TF_MAP[tf] || TF_MAP['1D'];
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=${interval}&range=${range}`;
+    let lastErr, j;
+    const proxies = getProxies();
+    for(let attempt=0; attempt<2; attempt++){
+      for(const wrap of proxies){
+        try{
+          const r = await tFetch(wrap(url), 8000);
+          if(!r.ok){ lastErr = new Error('HTTP '+r.status); continue; }
+          const t = await r.text();
+          try { j = JSON.parse(t); } catch { lastErr = new Error('bad json'); continue; }
+          if(j?.chart?.result?.[0]) return parseYahoo(j, tf);
+          lastErr = new Error(j?.chart?.error?.description || 'no data');
+        }catch(e){ lastErr = e; }
+      }
+    }
+    throw lastErr || new Error('all proxies failed');
+  } finally { release(); }
+}
+
+function parseYahoo(j, tf){
+  const res = j.chart.result[0];
+  const ts = res.timestamp || [];
+  const q = res.indicators.quote[0];
+  const bars = [];
+  for(let i=0;i<ts.length;i++){
+    if(q.open[i]==null||q.close[i]==null) continue;
+    bars.push({time:ts[i], open:q.open[i], high:q.high[i], low:q.low[i],
+               close:q.close[i], volume:q.volume[i]||0});
+  }
+  return tf==='4h' ? resample(bars, 4*60*60) : bars;
+}
+
+function resample(bars, sec){
+  const out=[]; let cur=null;
+  for(const b of bars){
+    const bucket = Math.floor(b.time/sec)*sec;
+    if(!cur || cur.time!==bucket){
+      if(cur) out.push(cur);
+      cur = {time:bucket, open:b.open, high:b.high, low:b.low, close:b.close, volume:b.volume};
+    } else {
+      cur.high = Math.max(cur.high,b.high);
+      cur.low  = Math.min(cur.low, b.low);
+      cur.close= b.close;
+      cur.volume += b.volume;
+    }
+  }
+  if(cur) out.push(cur);
+  return out;
+}
+
+/* =========================================================================
+ *  THEME / CHART OPTIONS
+ * =========================================================================*/
+const COMMON_OPTS = {
+  layout:{background:{type:'solid', color:'#131722'}, textColor:'#d1d4dc'},
+  grid:{vertLines:{color:'rgba(42,46,57,0.5)'}, horzLines:{color:'rgba(42,46,57,0.5)'}},
+  rightPriceScale:{borderColor:'#2a2e39'},
+  timeScale:{borderColor:'#2a2e39', timeVisible:true, secondsVisible:false},
+  crosshair:{mode:1},
+};
+const SUB_OPTS = {
+  ...COMMON_OPTS,
+  timeScale:{...COMMON_OPTS.timeScale, visible:false},
+};
+const GREEN='#26a69a', RED='#ef5350';
+const DEFAULTS = ['AAPL','MSFT','TSLA','NVDA','SPY','QQQ'];
+
+/* =========================================================================
+ *  COMPONENTS
+ * =========================================================================*/
+
+function Toolbar({layout,setLayout, gType,setGType, gTf,setGTf, onApplyAll}){
+  const Btn = ({active, ...p}) =>
+    <button {...p} className={`px-3 py-1.5 rounded text-xs border ${
+      active ? 'bg-blue-600 border-blue-600 text-white' :
+               'bg-[#2a2e39] border-[#2a2e39] text-gray-200 hover:bg-[#363a45]'}`} />;
+  const Group = ({label,children}) =>
+    <div className="flex items-center gap-1">
+      <span className="text-[10px] uppercase tracking-wider text-gray-500 mr-1">{label}</span>
+      {children}
+    </div>;
+  return (
+    <div className="flex items-center gap-4 px-3 py-2 bg-[#1e222d] border-b border-[#2a2e39] flex-wrap">
+      <div className="font-semibold text-white">📊 Stock Dashboard</div>
+      <div className="w-px h-5 bg-[#2a2e39]" />
+      <Group label="Layout">
+        {[1,2,4,6].map(n =>
+          <Btn key={n} active={layout===n} onClick={()=>setLayout(n)}>{n}</Btn>)}
+      </Group>
+      <div className="w-px h-5 bg-[#2a2e39]" />
+      <Group label="Default Type">
+        {['candlestick','bar','line'].map(t =>
+          <Btn key={t} active={gType===t} onClick={()=>setGType(t)}>
+            {t==='candlestick'?'Candle':t==='bar'?'Bar':'Line'}
+          </Btn>)}
+      </Group>
+      <div className="w-px h-5 bg-[#2a2e39]" />
+      <Group label="Default TF">
+        {Object.keys(TF_MAP).map(tf =>
+          <Btn key={tf} active={gTf===tf} onClick={()=>setGTf(tf)}>{tf}</Btn>)}
+      </Group>
+      <Btn onClick={onApplyAll}>Apply default TF/type to all</Btn>
+      <Btn onClick={()=>{
+        const cur = localStorage.getItem('customProxy') || '';
+        const v = prompt(
+          'Custom CORS proxy URL (leave blank to use public proxies).\n' +
+          'Use {url} as placeholder, or end with "/" for path-append style.\n\n' +
+          'Examples:\n' +
+          '  https://your-worker.workers.dev/?url={url}\n' +
+          '  https://your-proxy.com/',
+          cur);
+        if(v===null) return;
+        if(v.trim()==='') localStorage.removeItem('customProxy');
+        else localStorage.setItem('customProxy', v.trim());
+        alert('Saved. Reload or re-fetch to apply.');
+      }}>⚙ Proxy</Btn>
+    </div>
+  );
+}
+
+function IndicatorDropdown({ind, setInd, onClose}){
+  const update = (patch)=> setInd({...ind, ...patch});
+  const setEma = (idx, patch)=>{
+    const next = ind.ema.map((e,i)=> i===idx ? {...e, ...patch} : e);
+    update({ema: next});
+  };
+  const addEma = ()=> update({ema:[...ind.ema, {period:30, color:'#4fc3f7', enabled:true}]});
+  const rmEma  = (i)=> update({ema: ind.ema.filter((_,j)=>j!==i)});
+
+  return (
+    <div className="absolute right-2 top-12 z-20 w-72 bg-[#1e222d] border border-[#2a2e39] rounded shadow-lg p-3 text-xs scroll-thin max-h-[80vh] overflow-y-auto">
+      <div className="flex justify-between items-center mb-2">
+        <span className="font-semibold text-white">Indicators</span>
+        <button onClick={onClose} className="text-gray-400 hover:text-white">✕</button>
+      </div>
+
+      <div className="text-gray-400 mt-2 mb-1">Sub-panes</div>
+      {['volume','rsi','macd'].map(k=>
+        <label key={k} className="flex items-center gap-2 py-1">
+          <input type="checkbox" checked={k==='volume'?ind.volume:ind[k].enabled}
+            onChange={e=>k==='volume'?update({volume:e.target.checked})
+                                     :update({[k]:{...ind[k], enabled:e.target.checked}})}/>
+          <span className="capitalize">{k}</span>
+          {k==='rsi' && ind.rsi.enabled && (
+            <input type="number" value={ind.rsi.period} min="2" max="100"
+              onChange={e=>update({rsi:{...ind.rsi, period:+e.target.value||14}})}
+              className="w-12 ml-auto bg-[#131722] border border-[#434651] px-1"/>
+          )}
+        </label>
+      )}
+
+      <div className="text-gray-400 mt-3 mb-1 flex items-center justify-between">
+        <span>Overlays</span>
+      </div>
+
+      <label className="flex items-center gap-2 py-1">
+        <input type="checkbox" checked={ind.bb.enabled}
+          onChange={e=>update({bb:{...ind.bb, enabled:e.target.checked}})}/>
+        <span>Bollinger</span>
+        <input type="number" value={ind.bb.period} min="2" max="100"
+          onChange={e=>update({bb:{...ind.bb, period:+e.target.value||20}})}
+          className="w-12 bg-[#131722] border border-[#434651] px-1"/>
+        <input type="number" value={ind.bb.mult} step="0.1" min="0.5" max="5"
+          onChange={e=>update({bb:{...ind.bb, mult:parseFloat(e.target.value)||2}})}
+          className="w-12 bg-[#131722] border border-[#434651] px-1"/>
+        <input type="color" value={ind.bb.color}
+          onChange={e=>update({bb:{...ind.bb, color:e.target.value}})}
+          className="w-6 h-5 ml-auto border-0 bg-transparent"/>
+      </label>
+
+      <label className="flex items-center gap-2 py-1">
+        <input type="checkbox" checked={ind.vwap.enabled}
+          onChange={e=>update({vwap:{...ind.vwap, enabled:e.target.checked}})}/>
+        <span>VWAP</span>
+        <input type="color" value={ind.vwap.color}
+          onChange={e=>update({vwap:{...ind.vwap, color:e.target.value}})}
+          className="w-6 h-5 ml-auto border-0 bg-transparent"/>
+      </label>
+
+      <div className="text-gray-400 mt-3 mb-1 flex items-center justify-between">
+        <span>EMAs</span>
+        <button onClick={addEma} className="text-blue-400 hover:text-blue-200">+ Add</button>
+      </div>
+      {ind.ema.map((e,i)=>
+        <div key={i} className="flex items-center gap-2 py-1">
+          <input type="checkbox" checked={e.enabled!==false}
+            onChange={ev=>setEma(i,{enabled:ev.target.checked})}/>
+          <span className="w-10">EMA</span>
+          <input type="number" value={e.period} min="2" max="500"
+            onChange={ev=>setEma(i,{period:+ev.target.value||9})}
+            className="w-14 bg-[#131722] border border-[#434651] px-1"/>
+          <input type="color" value={e.color}
+            onChange={ev=>setEma(i,{color:ev.target.value})}
+            className="w-6 h-5 border-0 bg-transparent"/>
+          <button onClick={()=>rmEma(i)} className="ml-auto text-gray-500 hover:text-red-400">✕</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+const EXCHANGES = {
+  US:  {label:'US',  suffix:''},
+  NSE: {label:'NSE', suffix:'.NS'},
+  BSE: {label:'BSE', suffix:'.BO'},
+};
+// Detect which exchange a full symbol belongs to (for re-displaying without suffix)
+function splitSym(full){
+  if(full.endsWith('.NS')) return {ex:'NSE', base:full.slice(0,-3)};
+  if(full.endsWith('.BO')) return {ex:'BSE', base:full.slice(0,-3)};
+  return {ex:'US', base:full};
+}
+
+function PanelHeader({symbol, onSymbol, tf, setTf, type, setType, last, chg, pct, onToggleInd}){
+  const split = splitSym(symbol);
+  const [val, setVal] = useState(split.base);
+  const [ex, setEx]   = useState(split.ex);
+  useEffect(()=>{ const s=splitSym(symbol); setVal(s.base); setEx(s.ex); }, [symbol]);
+
+  const submit = (rawSym, exchange)=>{
+    const base = rawSym.trim().toUpperCase().replace(/\.(NS|BO)$/,'');
+    if(!base) return;
+    onSymbol(base + EXCHANGES[exchange].suffix);
+  };
+
+  return (
+    <div className="flex items-center gap-2 px-2 py-1.5 border-b border-[#2a2e39] bg-[#1e222d] flex-wrap">
+      <select value={ex} onChange={e=>{ setEx(e.target.value); submit(val, e.target.value); }}
+        className="bg-[#131722] border border-[#434651] rounded px-1 py-0.5 text-xs">
+        {Object.entries(EXCHANGES).map(([k,v])=><option key={k} value={k}>{v.label}</option>)}
+      </select>
+      <input value={val} onChange={e=>setVal(e.target.value.toUpperCase())}
+        onKeyDown={e=>{ if(e.key==='Enter') submit(val, ex); }}
+        className="w-24 bg-[#131722] border border-[#434651] rounded px-2 py-0.5 text-xs font-semibold uppercase"/>
+      <select value={tf} onChange={e=>setTf(e.target.value)}
+        className="bg-[#131722] border border-[#434651] rounded px-1 py-0.5 text-xs">
+        {Object.keys(TF_MAP).map(k=><option key={k} value={k}>{k}</option>)}
+      </select>
+      <select value={type} onChange={e=>setType(e.target.value)}
+        className="bg-[#131722] border border-[#434651] rounded px-1 py-0.5 text-xs">
+        <option value="candlestick">Candle</option>
+        <option value="bar">Bar</option>
+        <option value="line">Line</option>
+      </select>
+      <button onClick={onToggleInd}
+        className="bg-[#131722] border border-[#434651] rounded px-2 py-0.5 text-xs hover:bg-[#2a2e39]">
+        + Ind
+      </button>
+      {last!=null && (
+        <div className="ml-auto flex items-center gap-2 text-xs">
+          <span className="font-semibold text-white">{last.toFixed(2)}</span>
+          <span className={chg>=0?'text-[#26a69a]':'text-[#ef5350]'}>
+            {chg>=0?'+':''}{chg.toFixed(2)} ({pct.toFixed(2)}%)
+          </span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ChartPanel({initialSymbol, initialTf, initialType}){
+  const [symbol, setSymbol] = useState(initialSymbol);
+  const [tf, setTf]         = useState(initialTf);
+  const [type, setType]     = useState(initialType);
+  const [bars, setBars]     = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr]       = useState(null);
+  const [showInd, setShowInd] = useState(false);
+
+  const [ind, setInd] = useState({
+    ema:[
+      {period:9, color:'#ff9800', enabled:true},
+      {period:21,color:'#2196f3', enabled:true},
+      {period:50,color:'#9c27b0', enabled:false},
+      {period:200,color:'#f44336',enabled:false},
+    ],
+    bb:{enabled:false, period:20, mult:2, color:'#9575cd'},
+    vwap:{enabled:false, color:'#ffd54f'},
+    rsi:{enabled:false, period:14},
+    macd:{enabled:false, fast:12, slow:26, signal:9},
+    volume:true,
+  });
+
+  // sync external defaults
+  useEffect(()=>setTf(initialTf),   [initialTf]);
+  useEffect(()=>setType(initialType),[initialType]);
+
+  // sync external default symbol changes (Apply All) — handled by parent reload via key/symbol direct set: skip
+
+  // refs to DOM nodes + chart instances
+  const mainRef = useRef(null), volRef = useRef(null), rsiRef = useRef(null), macdRef = useRef(null);
+  const charts  = useRef({});  // {main, vol, rsi, macd}
+
+  // load data — clear bars first so a failed load doesn't leave the prior chart on screen
+  useEffect(()=>{
+    let cancelled=false;
+    setLoading(true); setErr(null); setBars([]);
+    fetchStockData(symbol, tf)
+      .then(b=>{ if(!cancelled){
+        if(!b || b.length===0){ setErr('no data for '+symbol); setLoading(false); return; }
+        setBars(b); setLoading(false);
+      } })
+      .catch(e=>{ if(!cancelled){ setErr(e.message); setLoading(false); } });
+    return ()=>{ cancelled=true; };
+  }, [symbol, tf]);
+
+  // create/destroy charts based on which sub-panes are enabled
+  useEffect(()=>{
+    const c = charts.current;
+    if(!c.main && mainRef.current){
+      c.main = LightweightCharts.createChart(mainRef.current, COMMON_OPTS);
+    }
+    if(ind.volume && !c.vol && volRef.current){
+      c.vol = LightweightCharts.createChart(volRef.current, SUB_OPTS);
+    } else if(!ind.volume && c.vol){ c.vol.remove(); c.vol=null; }
+
+    if(ind.rsi.enabled && !c.rsi && rsiRef.current){
+      c.rsi = LightweightCharts.createChart(rsiRef.current, SUB_OPTS);
+    } else if(!ind.rsi.enabled && c.rsi){ c.rsi.remove(); c.rsi=null; }
+
+    if(ind.macd.enabled && !c.macd && macdRef.current){
+      c.macd = LightweightCharts.createChart(macdRef.current, SUB_OPTS);
+    } else if(!ind.macd.enabled && c.macd){ c.macd.remove(); c.macd=null; }
+
+    // sync sub-panes to main timescale
+    if(c.main){
+      const main = c.main;
+      const subs = ()=> [c.vol, c.rsi, c.macd].filter(Boolean);
+      main.timeScale().subscribeVisibleLogicalRangeChange(r=>{
+        if(!r) return;
+        subs().forEach(s=> s.timeScale().setVisibleLogicalRange(r));
+      });
+    }
+  }, [ind.volume, ind.rsi.enabled, ind.macd.enabled]);
+
+  // resize handling
+  useEffect(()=>{
+    const ro = new ResizeObserver(()=>{
+      const c = charts.current;
+      const fit = (chart, el)=>{ if(!chart||!el) return;
+        const r = el.getBoundingClientRect();
+        if(r.width>0 && r.height>0) chart.resize(r.width, r.height);
+      };
+      fit(c.main, mainRef.current);
+      fit(c.vol,  volRef.current);
+      fit(c.rsi,  rsiRef.current);
+      fit(c.macd, macdRef.current);
+    });
+    [mainRef, volRef, rsiRef, macdRef].forEach(r=>r.current && ro.observe(r.current));
+    return ()=>ro.disconnect();
+  }, [ind.volume, ind.rsi.enabled, ind.macd.enabled]);
+
+  // unmount cleanup
+  useEffect(()=>()=>{
+    Object.values(charts.current).forEach(c=>c && c.remove());
+    charts.current = {};
+  }, []);
+
+  // draw price + overlays
+  useEffect(()=>{
+    const c = charts.current.main;
+    if(!c || bars.length===0) return;
+
+    // tear down series
+    if(c._series){
+      try{ for(const s of c._series) c.removeSeries(s); }catch(e){}
+    }
+    c._series = [];
+
+    let priceSeries;
+    if(type==='candlestick'){
+      priceSeries = c.addCandlestickSeries({
+        upColor:GREEN, downColor:RED,
+        borderUpColor:GREEN, borderDownColor:RED,
+        wickUpColor:GREEN, wickDownColor:RED,
+      });
+      priceSeries.setData(bars.map(b=>({time:b.time, open:b.open, high:b.high, low:b.low, close:b.close})));
+    } else if(type==='bar'){
+      priceSeries = c.addBarSeries({upColor:GREEN, downColor:RED});
+      priceSeries.setData(bars.map(b=>({time:b.time, open:b.open, high:b.high, low:b.low, close:b.close})));
+    } else {
+      priceSeries = c.addLineSeries({color:'#2962ff', lineWidth:2});
+      priceSeries.setData(bars.map(b=>({time:b.time, value:b.close})));
+    }
+    c._series.push(priceSeries);
+
+    // EMAs
+    for(const e of ind.ema){
+      if(e.enabled===false) continue;
+      const s = c.addLineSeries({color:e.color, lineWidth:1, priceLineVisible:false});
+      s.setData(calcEMA(bars, e.period));
+      c._series.push(s);
+    }
+    // Bollinger
+    if(ind.bb.enabled){
+      const bbData = calcBB(bars, ind.bb.period, ind.bb.mult);
+      const up = c.addLineSeries({color:ind.bb.color, lineWidth:1, priceLineVisible:false});
+      up.setData(bbData.map(p=>({time:p.time, value:p.upper})));
+      const mid = c.addLineSeries({color:ind.bb.color, lineWidth:1, lineStyle:2, priceLineVisible:false});
+      mid.setData(bbData.map(p=>({time:p.time, value:p.middle})));
+      const lo = c.addLineSeries({color:ind.bb.color, lineWidth:1, priceLineVisible:false});
+      lo.setData(bbData.map(p=>({time:p.time, value:p.lower})));
+      c._series.push(up, mid, lo);
+    }
+    // VWAP
+    if(ind.vwap.enabled){
+      const s = c.addLineSeries({color:ind.vwap.color, lineWidth:2, priceLineVisible:false});
+      s.setData(calcVWAP(bars));
+      c._series.push(s);
+    }
+
+    c.timeScale().fitContent();
+  }, [bars, type, ind.ema, ind.bb, ind.vwap]);
+
+  // volume sub-pane
+  useEffect(()=>{
+    const c = charts.current.vol;
+    if(!c || bars.length===0) return;
+    if(c._series){ try{ for(const s of c._series) c.removeSeries(s); }catch(e){} }
+    c._series = [];
+    const s = c.addHistogramSeries({priceFormat:{type:'volume'}});
+    s.setData(bars.map(b=>({time:b.time, value:b.volume,
+      color: b.close>=b.open ? 'rgba(38,166,154,0.6)' : 'rgba(239,83,80,0.6)'})));
+    c._series.push(s);
+  }, [bars, ind.volume]);
+
+  // RSI sub-pane
+  useEffect(()=>{
+    const c = charts.current.rsi;
+    if(!c || bars.length===0) return;
+    if(c._series){ try{ for(const s of c._series) c.removeSeries(s); }catch(e){} }
+    c._series = [];
+    const rsiData = calcRSI(bars, ind.rsi.period);
+    const s = c.addLineSeries({color:'#ba68c8', lineWidth:2, priceLineVisible:false});
+    s.setData(rsiData);
+    const ob = c.addLineSeries({color:'rgba(239,83,80,0.5)', lineWidth:1, lineStyle:2, priceLineVisible:false});
+    ob.setData(bars.map(b=>({time:b.time, value:70})));
+    const os = c.addLineSeries({color:'rgba(38,166,154,0.5)', lineWidth:1, lineStyle:2, priceLineVisible:false});
+    os.setData(bars.map(b=>({time:b.time, value:30})));
+    c._series.push(s, ob, os);
+  }, [bars, ind.rsi.enabled, ind.rsi.period]);
+
+  // MACD sub-pane
+  useEffect(()=>{
+    const c = charts.current.macd;
+    if(!c || bars.length===0) return;
+    if(c._series){ try{ for(const s of c._series) c.removeSeries(s); }catch(e){} }
+    c._series = [];
+    const md = calcMACD(bars, ind.macd.fast, ind.macd.slow, ind.macd.signal);
+    const sMacd = c.addLineSeries({color:'#2962ff', lineWidth:2, priceLineVisible:false});
+    sMacd.setData(md.filter(p=>p.macd!=null).map(p=>({time:p.time, value:p.macd})));
+    const sSig = c.addLineSeries({color:'#ff9800', lineWidth:1, priceLineVisible:false});
+    sSig.setData(md.filter(p=>p.signal!=null).map(p=>({time:p.time, value:p.signal})));
+    const sHist = c.addHistogramSeries({});
+    sHist.setData(md.filter(p=>p.histogram!=null).map(p=>({time:p.time, value:p.histogram,
+      color: p.histogram>=0 ? 'rgba(38,166,154,0.7)' : 'rgba(239,83,80,0.7)'})));
+    c._series.push(sMacd, sSig, sHist);
+  }, [bars, ind.macd.enabled, ind.macd.fast, ind.macd.slow, ind.macd.signal]);
+
+  // last/chg
+  const stats = useMemo(()=>{
+    if(bars.length<2) return {};
+    const last = bars[bars.length-1].close, prev = bars[bars.length-2].close;
+    return {last, chg:last-prev, pct:(last-prev)/prev*100};
+  },[bars]);
+
+  return (
+    <div className="relative bg-[#1e222d] border border-[#2a2e39] rounded flex flex-col min-w-0 min-h-0 overflow-hidden">
+      <PanelHeader
+        symbol={symbol} onSymbol={s=>s && setSymbol(s)}
+        tf={tf} setTf={setTf}
+        type={type} setType={setType}
+        last={stats.last} chg={stats.chg} pct={stats.pct}
+        onToggleInd={()=>setShowInd(v=>!v)}
+      />
+      {showInd && <IndicatorDropdown ind={ind} setInd={setInd} onClose={()=>setShowInd(false)} />}
+      <div className="flex-1 flex flex-col min-h-0 relative">
+        {(loading || err) && (
+          <div className={`absolute inset-0 flex items-center justify-center z-10 pointer-events-none text-xs ${err?'text-[#ef5350]':'text-gray-400'}`}>
+            {err ? `Failed: ${err}` : `Loading ${symbol}…`}
+          </div>
+        )}
+        <div ref={mainRef} className="flex-[3] min-h-0" />
+        {ind.volume && <div ref={volRef} className="h-20 border-t border-[#2a2e39]" />}
+        {ind.rsi.enabled && <div ref={rsiRef} className="h-24 border-t border-[#2a2e39]" />}
+        {ind.macd.enabled && <div ref={macdRef} className="h-24 border-t border-[#2a2e39]" />}
+      </div>
+    </div>
+  );
+}
+
+function App(){
+  const [layout, setLayout] = useState(4);
+  const [gType, setGType]   = useState('candlestick');
+  const [gTf, setGTf]       = useState('1D');
+  // a key bump forces all panels to remount with new defaults on "Apply All"
+  const [applyKey, setApplyKey] = useState(0);
+
+  const gridCls = {1:'grid-cols-1 grid-rows-1',
+                   2:'grid-cols-2 grid-rows-1',
+                   4:'grid-cols-2 grid-rows-2',
+                   6:'grid-cols-3 grid-rows-2'}[layout];
+
+  return (
+    <div className="h-full flex flex-col">
+      <Toolbar
+        layout={layout} setLayout={setLayout}
+        gType={gType} setGType={setGType}
+        gTf={gTf} setGTf={setGTf}
+        onApplyAll={()=>setApplyKey(k=>k+1)}
+      />
+      <div className={`flex-1 grid gap-1.5 p-1.5 min-h-0 ${gridCls}`}>
+        {Array.from({length:layout}).map((_,i)=>
+          <ChartPanel
+            key={`${layout}-${i}-${applyKey}`}
+            initialSymbol={DEFAULTS[i % DEFAULTS.length]}
+            initialTf={gTf}
+            initialType={gType}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
