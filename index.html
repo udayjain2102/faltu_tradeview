@@ -90,13 +90,14 @@ function calcRSI(bars, period=14){
     if(d>=0) g+=d; else l-=d;
   }
   let avgG = g/period, avgL = l/period;
-  out.push({time:bars[period].time, value: avgL===0?100: 100-100/(1+avgG/avgL)});
+  const rsiVal = (aG,aL)=> aL===0?(aG===0?50:100): 100-100/(1+aG/aL);
+  out.push({time:bars[period].time, value: rsiVal(avgG,avgL)});
   for(let i=period+1;i<bars.length;i++){
     const d = bars[i].close-bars[i-1].close;
     const gi = d>0?d:0, li = d<0?-d:0;
     avgG = (avgG*(period-1)+gi)/period;
     avgL = (avgL*(period-1)+li)/period;
-    out.push({time:bars[i].time, value: avgL===0?100: 100-100/(1+avgG/avgL)});
+    out.push({time:bars[i].time, value: rsiVal(avgG,avgL)});
   }
   return out;
 }
@@ -147,8 +148,14 @@ function customProxyWrap(){
   return u => p.includes('{url}') ? p.replace('{url}', encodeURIComponent(u))
                                   : p.replace(/\/?$/, '/') + u;
 }
+// Same-origin proxy — exists when served by Vercel (api/yahoo.js) or by
+// the bundled local server.js. Tried first; if it 404s (static file open),
+// we fall through to public proxies.
+const sameOriginProxy = u => '/api/yahoo?url=' + encodeURIComponent(u);
+
 function getProxies(){
   const list = [
+    sameOriginProxy,
     u => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(u),
     u => 'https://corsproxy.io/?' + encodeURIComponent(u),
     u => 'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(u),
